@@ -2,13 +2,13 @@
 
 A clean-room project for hybrid attention-mask generation in transformer workloads, supporting both full-attention and sliding-window attention patterns.
 
-The current milestone focuses on a reliable PyTorch correctness reference. CUDA implementation and performance work are planned for later milestones.
+The project now includes a reliable PyTorch correctness reference and a readable baseline CUDA implementation. Performance optimization is intentionally deferred until the baseline is compiled and validated on NVIDIA hardware.
 
 ## Overview
 
 Modern transformer architectures may use different attention patterns across heads. Some heads attend over the complete available context, while others operate within a restricted sliding window.
 
-Milestone 1 implements the mask semantics in PyTorch and verifies them with correctness tests.
+The PyTorch implementation defines the mask semantics. A standalone CUDA runner enables direct elementwise comparison between the baseline CUDA output and that reference.
 
 The project covers:
 
@@ -17,7 +17,7 @@ The project covers:
 - Per-head hybrid attention patterns
 - Optional prefix / past-key-value context
 - Correctness validation with a Python/PyTorch reference
-- CUDA latency and throughput benchmarking in future milestones
+- Baseline CUDA mask generation and integration-test infrastructure
 
 ## Mask Semantics
 
@@ -57,25 +57,53 @@ Implemented now:
 - Per-head full-versus-sliding configuration
 - Cached prefix (`past_len`), floating-point dtype, and device support
 - Pytest correctness and input-validation coverage
+- Baseline float32 CUDA kernel using simple one-dimensional grid-stride indexing
+- Reusable asynchronous CUDA launcher with argument and launch-error reporting
+- Standalone CUDA runner with deterministic `0`/`-inf` output
+- Parameterized integration tests that compare CUDA output to the PyTorch oracle
+
+Validation status:
+
+- The Python reference tests are validated on the current macOS development host.
+- CUDA integration tests skip clearly when the runner or a CUDA-capable device is unavailable.
+- The current host has no NVIDIA CUDA compiler or device, so CUDA compilation and runtime correctness validation remain pending on an NVIDIA CUDA environment.
 
 Planned later:
 
-- Baseline CUDA implementation
-- Optimized CUDA kernels
-- GPU benchmarking and profiling
+- Baseline GPU compile/runtime validation on NVIDIA hardware
+- GPU profiling and kernel optimization
+- GPU benchmarking
 
-No CUDA kernels or performance claims are included in Milestone 1.
+No performance claims or optimized CUDA techniques are included in Milestone 2.
 
 ## Setup and tests
 
-Create an isolated Python environment, then install the two test dependencies:
+Create an isolated Python environment, then install the test dependencies:
 
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
-python -m pip install torch pytest
+python -m pip install torch pytest numpy
 python -m pytest -q
 ```
+
+## CUDA build and integration tests
+
+CMake configures without CUDA targets when no CUDA compiler is installed. On a machine with an NVIDIA CUDA toolkit:
+
+```bash
+cmake -S . -B build
+cmake --build build
+HYBRID_MASK_CUDA_RUNNER=build/cuda_mask_runner python -m pytest tests/test_cuda_integration.py -q
+```
+
+The runner accepts five dimensions followed by one mode per head, where `1` selects full causal attention and `0` selects sliding-window causal attention:
+
+```bash
+build/cuda_mask_runner 1 2 4 0 2 1 0
+```
+
+It prints the flattened row-major float32 mask as whitespace-delimited `0` and `-inf` values. Diagnostics are written to standard error.
 
 ## Reference API
 
@@ -95,3 +123,7 @@ mask = create_hybrid_attention_mask(
     device="cpu",
 )
 ```
+
+## Next milestone
+
+Milestone 3: GPU validation, profiling, and optimization after the baseline is proven correct on NVIDIA hardware.
