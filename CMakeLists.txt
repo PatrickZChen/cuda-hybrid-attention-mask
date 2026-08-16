@@ -34,6 +34,20 @@ if(CMAKE_CUDA_COMPILER)
             CUDA_STANDARD_REQUIRED ON
             CUDA_EXTENSIONS OFF
     )
+
+    add_executable(
+        cuda_baseline_benchmark benchmarks/cuda_baseline_benchmark.cu
+    )
+    target_link_libraries(
+        cuda_baseline_benchmark PRIVATE hybrid_attention_mask
+    )
+    set_target_properties(
+        cuda_baseline_benchmark
+        PROPERTIES
+            CUDA_STANDARD 17
+            CUDA_STANDARD_REQUIRED ON
+            CUDA_EXTENSIONS OFF
+    )
 else()
     message(STATUS "CUDA compiler not found; CUDA targets disabled")
 endif()
