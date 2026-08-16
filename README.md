@@ -71,7 +71,7 @@ Implemented now:
 - Parameterized integration tests that compare CUDA output to the PyTorch oracle
 - Dedicated CUDA-event A/B benchmark with byte-for-byte output validation,
   alternating launch order, warmups, and per-launch distribution statistics
-- RTX 4080 Laptop GPU baseline, profiling, and Milestone 4A A/B reports
+- RTX 4080 Laptop GPU baseline, profiling, and Milestone 4A/4B A/B reports
 
 Validation status:
 
@@ -191,6 +191,10 @@ mask = create_hybrid_attention_mask(
 
 ## Milestone boundary
 
-Milestone 4A stops after the first row-oriented indexing optimization. The
-dense float32 representation and public API are unchanged; fusion, packed
-masks, Tensor Cores, PTX, and additional kernel optimizations are not included.
+Milestone 4B rejected dedicated all-full and all-sliding kernels because the
+measured gains were not stable or meaningful; the row-oriented hybrid kernel
+remains the default. The dense float32 representation and public API are
+unchanged; fusion, packed masks, Tensor Cores, PTX, and additional kernel
+optimizations are not included. See
+[`benchmarks/MILESTONE_4B.md`](benchmarks/MILESTONE_4B.md) for the real A/B
+measurements and decision.
