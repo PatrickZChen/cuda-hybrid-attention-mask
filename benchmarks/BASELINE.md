@@ -1,5 +1,9 @@
 # RTX 4080 Laptop GPU baseline
 
+This document preserves the pre-optimization Milestone 3B measurements. See
+[`MILESTONE_4A.md`](MILESTONE_4A.md) for the measured baseline-versus-row-kernel
+comparison.
+
 This is the unoptimized Milestone 3B baseline for
 `launch_hybrid_attention_mask()`. The CUDA kernel and public launcher were not
 changed for these measurements.

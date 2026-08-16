@@ -41,6 +41,10 @@ if(CMAKE_CUDA_COMPILER)
     target_link_libraries(
         cuda_baseline_benchmark PRIVATE hybrid_attention_mask
     )
+    target_include_directories(
+        cuda_baseline_benchmark
+        PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src"
+    )
     set_target_properties(
         cuda_baseline_benchmark
         PROPERTIES

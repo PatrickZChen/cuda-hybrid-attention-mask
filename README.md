@@ -2,13 +2,18 @@
 
 A clean-room project for hybrid attention-mask generation in transformer workloads, supporting both full-attention and sliding-window attention patterns.
 
-The project now includes a reliable PyTorch correctness reference, a readable baseline CUDA implementation, and a reproducible hardware-specific performance baseline. Kernel optimization remains intentionally deferred.
+The project includes a reliable PyTorch correctness reference, a preserved
+baseline CUDA implementation, and a row-oriented CUDA kernel that removes
+per-element coordinate reconstruction while retaining the same dense float32
+API and semantics.
 
 ## Overview
 
 Modern transformer architectures may use different attention patterns across heads. Some heads attend over the complete available context, while others operate within a restricted sliding window.
 
-The PyTorch implementation defines the mask semantics. A standalone CUDA runner enables direct elementwise comparison between the baseline CUDA output and that reference.
+The PyTorch implementation defines the mask semantics. A standalone CUDA
+runner enables direct elementwise comparison between the default CUDA output
+and that reference.
 
 The project covers:
 
@@ -17,8 +22,8 @@ The project covers:
 - Per-head hybrid attention patterns
 - Optional prefix / past-key-value context
 - Correctness validation with a Python/PyTorch reference
-- Baseline CUDA mask generation and integration-test infrastructure
-- CUDA-event baseline benchmarking across full, sliding, and mixed head modes
+- Preserved flat baseline and default row-oriented CUDA mask kernels
+- CUDA-event A/B benchmarking across full, sliding, and mixed head modes
 - Hardware profiling notes with measured facts separated from interpretation
 
 ## Mask Semantics
@@ -59,26 +64,29 @@ Implemented now:
 - Per-head full-versus-sliding configuration
 - Cached prefix (`past_len`), floating-point dtype, and device support
 - Pytest correctness and input-validation coverage
-- Baseline float32 CUDA kernel using simple one-dimensional grid-stride indexing
+- Preserved baseline float32 kernel using one-dimensional grid-stride indexing
+- Default row-oriented kernel with one CUDA block per `[batch, head, query]` row
 - Reusable asynchronous CUDA launcher with argument and launch-error reporting
 - Standalone CUDA runner with deterministic `0`/`-inf` output
 - Parameterized integration tests that compare CUDA output to the PyTorch oracle
-- Dedicated CUDA-event benchmark with warmups and per-launch distribution statistics
-- RTX 4080 Laptop GPU baseline CSV and profiling report
+- Dedicated CUDA-event A/B benchmark with byte-for-byte output validation,
+  alternating launch order, warmups, and per-launch distribution statistics
+- RTX 4080 Laptop GPU baseline, profiling, and Milestone 4A A/B reports
 
 Validation status:
 
 - The Python reference and CUDA integration tests pass on an NVIDIA CUDA host.
-- The baseline CUDA output matches the PyTorch reference elementwise across the integration suite.
+- The default row-oriented CUDA output matches the PyTorch reference
+  elementwise across the integration suite.
 - Compute Sanitizer memcheck passes on a representative mixed-head case with `ERROR SUMMARY: 0 errors`.
-- The large alternating baseline produces 67,108,864 elements in a median 635.904 us on the measured RTX 4080 Laptop GPU.
+- The nine-case A/B benchmark validates baseline and optimized outputs
+  byte-for-byte before timing.
+- On the primary run, the large alternating case improves from 636.768 µs to
+  632.832 µs; the nine-case geometric-mean speedup is 1.160×.
 
-Planned later:
-
-- Milestone 4 kernel optimization, guided by the baseline evidence
-- Nsight Compute counter collection after the host enables performance-counter access
-
-All performance numbers below are specific to the recorded hardware and software environment. No optimized CUDA techniques are included in this baseline.
+Nsight Compute counter collection remains unavailable until the host enables
+performance-counter access. All performance numbers below are specific to the
+recorded hardware and software environment.
 
 ## GPU Validation
 
@@ -89,7 +97,8 @@ CUDA Toolkit:
 12.5
 
 Validation:
-Baseline CUDA output validated elementwise against the PyTorch reference.
+Row-oriented CUDA output validated elementwise against the PyTorch reference;
+the benchmark also validates it byte-for-byte against the preserved baseline.
 
 Compute Sanitizer memcheck:
 Representative mixed-head case passed with `ERROR SUMMARY: 0 errors`.
@@ -97,17 +106,30 @@ Representative mixed-head case passed with `ERROR SUMMARY: 0 errors`.
 Final pytest result:
 41 passed, 0 failed, 0 skipped.
 
-## RTX 4080 Laptop GPU performance baseline
+## RTX 4080 Laptop GPU Milestone 4A A/B results
 
-Release build, 1,000 warmups and 1,000 CUDA-event samples per row. The compact table shows alternating full/sliding heads; the complete nine-case matrix is in [`benchmarks/BASELINE.md`](benchmarks/BASELINE.md) and [`benchmarks/results/rtx4080_laptop_baseline.csv`](benchmarks/results/rtx4080_laptop_baseline.csv).
+Release build, 1,000 warmups and 1,000 CUDA-event samples per implementation
+and case, with baseline/optimized launch order alternated. The compact table
+shows alternating full/sliding heads. The complete nine-case primary matrix,
+methodology, and independent repeat summary are in
+[`benchmarks/MILESTONE_4A.md`](benchmarks/MILESTONE_4A.md); exact primary data
+are in
+[`benchmarks/results/rtx4080_laptop_milestone4a.csv`](benchmarks/results/rtx4080_laptop_milestone4a.csv).
 
-| Size | B×H×Q×KV | Output elements | median_us | Effective output GiB/s |
-| --- | ---: | ---: | ---: | ---: |
-| Small | 1×8×128×256 | 262,144 | 6.144 | 158.946 |
-| Medium | 1×16×512×1024 | 8,388,608 | 71.552 | 436.745 |
-| Large | 2×16×1024×2048 | 67,108,864 | 635.904 | 393.141 |
+| Size | B×H×Q×KV | Baseline median (µs) | Optimized median (µs) | Speedup | Optimized output GiB/s |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Small | 1×8×128×256 | 6.144 | 5.120 | 1.200× | 190.735 |
+| Medium | 1×16×512×1024 | 71.552 | 58.272 | 1.228× | 536.278 |
+| Large | 2×16×1024×2048 | 636.768 | 632.832 | 1.006× | 395.050 |
 
-Effective output GiB/s is the logical float32 output size (four bytes per element) divided by the median CUDA-event time and by `2^30`; it is not measured DRAM bandwidth. The comparison peak is a nominal value calculated from CUDA device properties: double-data-rate factor `2 × 9.001 GHz × (192 bits / 8) = 432.048 GB/s`, which is `402.376 GiB/s`. Thus, the reported 97.70% compares `393.141 GiB/s` with `402.376 GiB/s`; it is not a measured DRAM-utilization percentage. On a sustained large run, coarse, GPU-wide NVIDIA-SMI samples reported `mem=100%` and `sm=91–94%`. Taken together, these observations support the strong inference that dense output stores are likely the dominant large-case constraint, but this is not a directly measured Nsight Compute conclusion. Nsight Compute 2024.2.1 is installed, but the driver denied access to hardware performance counters (`ERR_NVGPUCTRPERM`), so achieved DRAM throughput, occupancy, and hardware branch metrics are not claimed. See [`benchmarks/PROFILE.md`](benchmarks/PROFILE.md) for the exact evidence and limitations.
+The primary geometric-mean speedup is 1.160× across all nine cases, and no
+case regressed by median in either the primary run or an independent repeat.
+The large cases improve by only 0.5–0.6%, consistent with dense output stores
+dominating that regime. Effective output GiB/s is logical float32 output size
+divided by median time; it is not measured DRAM bandwidth. In particular, the
+32 MiB medium output fits in the reported 48 MiB L2 and can exceed nominal DRAM
+bandwidth as a logical rate. See [`benchmarks/PROFILE.md`](benchmarks/PROFILE.md)
+for the baseline evidence and profiler limitations.
 
 ## Setup and tests
 
@@ -137,7 +159,7 @@ build/cuda_baseline_benchmark \
   --case all \
   --warmups 1000 \
   --iterations 1000 \
-  --output benchmarks/results/rtx4080_laptop_baseline.csv
+  --output benchmarks/results/rtx4080_laptop_milestone4a.csv
 ```
 
 The runner accepts five dimensions followed by one mode per head, where `1` selects full causal attention and `0` selects sliding-window causal attention:
@@ -167,6 +189,8 @@ mask = create_hybrid_attention_mask(
 )
 ```
 
-## Next milestone
+## Milestone boundary
 
-Milestone 4 kernel-level experiments are ranked in [`benchmarks/PROFILE.md`](benchmarks/PROFILE.md), beginning with reducing the repeated 64-bit division, modulo, and coordinate-reconstruction work in the flat indexing path. Eliminating mask materialization and adopting a packed representation are classified separately as architectural alternatives because they change the output or consumer contract. The kernel in this milestone remains the original readable implementation.
+Milestone 4A stops after the first row-oriented indexing optimization. The
+dense float32 representation and public API are unchanged; fusion, packed
+masks, Tensor Cores, PTX, and additional kernel optimizations are not included.

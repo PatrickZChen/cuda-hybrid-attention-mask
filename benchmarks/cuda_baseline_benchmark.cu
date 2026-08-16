@@ -1,10 +1,12 @@
 #include "attention_mask.cuh"
+#include "attention_mask_internal.cuh"
 
 #include <algorithm>
 #include <charconv>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
@@ -14,6 +16,7 @@
 #include <string>
 #include <string_view>
 #include <system_error>
+#include <utility>
 #include <vector>
 
 #include <cuda_runtime.h>
@@ -48,18 +51,39 @@ struct Options {
     bool list_cases = false;
 };
 
-struct BenchmarkResult {
-    const BenchmarkCase* benchmark_case;
-    int warmups;
-    int iterations;
+struct TimingStatistics {
     double median_us;
     double mean_us;
     double min_us;
     double p95_us;
-    std::uint64_t output_elements;
     double elements_per_second;
     double effective_output_gib_per_second;
 };
+
+struct BenchmarkResult {
+    const BenchmarkCase* benchmark_case;
+    int warmups;
+    int iterations;
+    std::uint64_t output_elements;
+    TimingStatistics baseline;
+    TimingStatistics optimized;
+    double speedup;
+};
+
+using KernelLauncher = cudaError_t (*)(
+    float*,
+    const std::uint8_t*,
+    std::int64_t,
+    std::int64_t,
+    std::int64_t,
+    std::int64_t,
+    std::int64_t,
+    cudaStream_t);
+
+constexpr KernelLauncher kBaselineLauncher =
+    hybrid_attention_mask::detail::launch_hybrid_attention_mask_baseline;
+constexpr KernelLauncher kRowLauncher =
+    hybrid_attention_mask::detail::launch_hybrid_attention_mask_row;
 
 constexpr BenchmarkCase kCases[] = {
     {"small-all-full", "small", HeadPattern::kAllFull, 1, 8, 128, 128, 64},
@@ -280,6 +304,159 @@ double percentile_95(const std::vector<double>& sorted_samples) {
     return sorted_samples[std::max<std::size_t>(1, rank) - 1];
 }
 
+cudaError_t launch_kernel(
+    KernelLauncher launcher,
+    float* output,
+    const std::uint8_t* device_modes,
+    const BenchmarkCase& benchmark_case,
+    cudaStream_t stream) {
+    return launcher(
+        output,
+        device_modes,
+        benchmark_case.batch_size,
+        benchmark_case.num_heads,
+        benchmark_case.seq_len,
+        benchmark_case.past_len,
+        benchmark_case.sliding_window,
+        stream);
+}
+
+bool validate_implementations_match(
+    const BenchmarkCase& benchmark_case,
+    std::uint64_t elements,
+    float* baseline_output,
+    float* optimized_output,
+    const std::uint8_t* device_modes,
+    cudaStream_t stream) {
+    if (report_cuda_error(
+            "baseline validation launch",
+            launch_kernel(
+                kBaselineLauncher,
+                baseline_output,
+                device_modes,
+                benchmark_case,
+                stream)) ||
+        report_cuda_error(
+            "optimized validation launch",
+            launch_kernel(
+                kRowLauncher,
+                optimized_output,
+                device_modes,
+                benchmark_case,
+                stream)) ||
+        report_cuda_error(
+            "cudaStreamSynchronize(validation)",
+            cudaStreamSynchronize(stream))) {
+        return false;
+    }
+
+    constexpr std::size_t kComparisonChunkElements = 1U << 20;
+    std::vector<float> baseline_chunk(kComparisonChunkElements);
+    std::vector<float> optimized_chunk(kComparisonChunkElements);
+    std::uint64_t offset = 0;
+    while (offset < elements) {
+        const auto remaining = static_cast<std::size_t>(
+            std::min<std::uint64_t>(elements - offset,
+                                    kComparisonChunkElements));
+        const std::size_t comparison_bytes = remaining * sizeof(float);
+        if (report_cuda_error(
+                "cudaMemcpy(baseline validation output)",
+                cudaMemcpy(
+                    baseline_chunk.data(),
+                    baseline_output + offset,
+                    comparison_bytes,
+                    cudaMemcpyDeviceToHost)) ||
+            report_cuda_error(
+                "cudaMemcpy(optimized validation output)",
+                cudaMemcpy(
+                    optimized_chunk.data(),
+                    optimized_output + offset,
+                    comparison_bytes,
+                    cudaMemcpyDeviceToHost))) {
+            return false;
+        }
+        if (std::memcmp(
+                baseline_chunk.data(),
+                optimized_chunk.data(),
+                comparison_bytes) != 0) {
+            for (std::size_t index = 0; index < remaining; ++index) {
+                if (std::memcmp(
+                        &baseline_chunk[index],
+                        &optimized_chunk[index],
+                        sizeof(float)) != 0) {
+                    std::cerr
+                        << "Output mismatch for " << benchmark_case.name
+                        << " at flat index " << offset + index
+                        << ": baseline=" << baseline_chunk[index]
+                        << ", optimized=" << optimized_chunk[index] << '\n';
+                    return false;
+                }
+            }
+        }
+        offset += remaining;
+    }
+    return true;
+}
+
+bool record_sample(
+    KernelLauncher launcher,
+    float* output,
+    const std::uint8_t* device_modes,
+    const BenchmarkCase& benchmark_case,
+    cudaStream_t stream,
+    cudaEvent_t start,
+    cudaEvent_t stop,
+    std::vector<double>* samples_us) {
+    if (report_cuda_error(
+            "cudaEventRecord(start)", cudaEventRecord(start, stream)) ||
+        report_cuda_error(
+            "timed kernel launch",
+            launch_kernel(
+                launcher,
+                output,
+                device_modes,
+                benchmark_case,
+                stream)) ||
+        report_cuda_error(
+            "cudaEventRecord(stop)", cudaEventRecord(stop, stream)) ||
+        report_cuda_error(
+            "cudaEventSynchronize(stop)", cudaEventSynchronize(stop))) {
+        return false;
+    }
+    float elapsed_ms = 0.0F;
+    if (report_cuda_error(
+            "cudaEventElapsedTime",
+            cudaEventElapsedTime(&elapsed_ms, start, stop))) {
+        return false;
+    }
+    samples_us->push_back(static_cast<double>(elapsed_ms) * 1000.0);
+    return true;
+}
+
+TimingStatistics summarize_samples(
+    std::vector<double> samples_us, std::uint64_t elements) {
+    std::sort(samples_us.begin(), samples_us.end());
+    const std::size_t middle = samples_us.size() / 2;
+    const double median_us = samples_us.size() % 2 == 0
+                                 ? (samples_us[middle - 1] + samples_us[middle]) /
+                                       2.0
+                                 : samples_us[middle];
+    const double mean_us =
+        std::accumulate(samples_us.begin(), samples_us.end(), 0.0) /
+        static_cast<double>(samples_us.size());
+    const double seconds = median_us / 1'000'000.0;
+    const double elements_per_second = static_cast<double>(elements) / seconds;
+    constexpr double kBytesPerGiB = 1024.0 * 1024.0 * 1024.0;
+    return {
+        median_us,
+        mean_us,
+        samples_us.front(),
+        percentile_95(samples_us),
+        elements_per_second,
+        elements_per_second * sizeof(float) / kBytesPerGiB,
+    };
+}
+
 bool run_case(
     const BenchmarkCase& benchmark_case,
     int warmups,
@@ -296,7 +473,8 @@ bool run_case(
     const std::vector<std::uint8_t> host_modes =
         make_head_modes(benchmark_case);
     std::uint8_t* device_modes = nullptr;
-    float* device_output = nullptr;
+    float* baseline_output = nullptr;
+    float* optimized_output = nullptr;
     cudaEvent_t start = nullptr;
     cudaEvent_t stop = nullptr;
 
@@ -307,8 +485,11 @@ bool run_case(
         if (start != nullptr) {
             cudaEventDestroy(start);
         }
-        if (device_output != nullptr) {
-            cudaFree(device_output);
+        if (optimized_output != nullptr) {
+            cudaFree(optimized_output);
+        }
+        if (baseline_output != nullptr) {
+            cudaFree(baseline_output);
         }
         if (device_modes != nullptr) {
             cudaFree(device_modes);
@@ -320,8 +501,11 @@ bool run_case(
             cudaMalloc(
                 reinterpret_cast<void**>(&device_modes), host_modes.size())) ||
         report_cuda_error(
-            "cudaMalloc(output)",
-            cudaMalloc(reinterpret_cast<void**>(&device_output), bytes)) ||
+            "cudaMalloc(baseline output)",
+            cudaMalloc(reinterpret_cast<void**>(&baseline_output), bytes)) ||
+        report_cuda_error(
+            "cudaMalloc(optimized output)",
+            cudaMalloc(reinterpret_cast<void**>(&optimized_output), bytes)) ||
         report_cuda_error(
             "cudaMemcpyAsync(head modes)",
             cudaMemcpyAsync(
@@ -338,17 +522,41 @@ bool run_case(
         return false;
     }
 
+    if (!validate_implementations_match(
+            benchmark_case,
+            elements,
+            baseline_output,
+            optimized_output,
+            device_modes,
+            stream)) {
+        cleanup();
+        return false;
+    }
+
     for (int iteration = 0; iteration < warmups; ++iteration) {
+        const KernelLauncher first =
+            iteration % 2 == 0 ? kBaselineLauncher : kRowLauncher;
+        const KernelLauncher second =
+            iteration % 2 == 0 ? kRowLauncher : kBaselineLauncher;
+        float* first_output =
+            iteration % 2 == 0 ? baseline_output : optimized_output;
+        float* second_output =
+            iteration % 2 == 0 ? optimized_output : baseline_output;
         if (report_cuda_error(
-                "warmup kernel launch",
-                hybrid_attention_mask::launch_hybrid_attention_mask(
-                    device_output,
+                "first warmup kernel launch",
+                launch_kernel(
+                    first,
+                    first_output,
                     device_modes,
-                    benchmark_case.batch_size,
-                    benchmark_case.num_heads,
-                    benchmark_case.seq_len,
-                    benchmark_case.past_len,
-                    benchmark_case.sliding_window,
+                    benchmark_case,
+                    stream)) ||
+            report_cuda_error(
+                "second warmup kernel launch",
+                launch_kernel(
+                    second,
+                    second_output,
+                    device_modes,
+                    benchmark_case,
                     stream))) {
             cleanup();
             return false;
@@ -360,65 +568,72 @@ bool run_case(
         return false;
     }
 
-    std::vector<double> samples_us;
-    samples_us.reserve(static_cast<std::size_t>(iterations));
+    std::vector<double> baseline_samples_us;
+    std::vector<double> optimized_samples_us;
+    baseline_samples_us.reserve(static_cast<std::size_t>(iterations));
+    optimized_samples_us.reserve(static_cast<std::size_t>(iterations));
     for (int iteration = 0; iteration < iterations; ++iteration) {
-        if (report_cuda_error(
-                "cudaEventRecord(start)", cudaEventRecord(start, stream)) ||
-            report_cuda_error(
-                "timed kernel launch",
-                hybrid_attention_mask::launch_hybrid_attention_mask(
-                    device_output,
+        const bool baseline_first = iteration % 2 == 0;
+        if (baseline_first) {
+            if (!record_sample(
+                    kBaselineLauncher,
+                    baseline_output,
                     device_modes,
-                    benchmark_case.batch_size,
-                    benchmark_case.num_heads,
-                    benchmark_case.seq_len,
-                    benchmark_case.past_len,
-                    benchmark_case.sliding_window,
-                    stream)) ||
-            report_cuda_error(
-                "cudaEventRecord(stop)", cudaEventRecord(stop, stream)) ||
-            report_cuda_error(
-                "cudaEventSynchronize(stop)", cudaEventSynchronize(stop))) {
+                    benchmark_case,
+                    stream,
+                    start,
+                    stop,
+                    &baseline_samples_us) ||
+                !record_sample(
+                    kRowLauncher,
+                    optimized_output,
+                    device_modes,
+                    benchmark_case,
+                    stream,
+                    start,
+                    stop,
+                    &optimized_samples_us)) {
+                cleanup();
+                return false;
+            }
+        } else if (!record_sample(
+                       kRowLauncher,
+                       optimized_output,
+                       device_modes,
+                       benchmark_case,
+                       stream,
+                       start,
+                       stop,
+                       &optimized_samples_us) ||
+                   !record_sample(
+                       kBaselineLauncher,
+                       baseline_output,
+                       device_modes,
+                       benchmark_case,
+                       stream,
+                       start,
+                       stop,
+                       &baseline_samples_us)) {
             cleanup();
             return false;
         }
-        float elapsed_ms = 0.0F;
-        if (report_cuda_error(
-                "cudaEventElapsedTime",
-                cudaEventElapsedTime(&elapsed_ms, start, stop))) {
-            cleanup();
-            return false;
-        }
-        samples_us.push_back(static_cast<double>(elapsed_ms) * 1000.0);
     }
 
     cleanup();
 
-    std::sort(samples_us.begin(), samples_us.end());
-    const std::size_t middle = samples_us.size() / 2;
-    const double median_us = samples_us.size() % 2 == 0
-                                 ? (samples_us[middle - 1] + samples_us[middle]) /
-                                       2.0
-                                 : samples_us[middle];
-    const double mean_us =
-        std::accumulate(samples_us.begin(), samples_us.end(), 0.0) /
-        static_cast<double>(samples_us.size());
-    const double seconds = median_us / 1'000'000.0;
-    const double elements_per_second = static_cast<double>(elements) / seconds;
-    constexpr double kBytesPerGiB = 1024.0 * 1024.0 * 1024.0;
+    const TimingStatistics baseline =
+        summarize_samples(std::move(baseline_samples_us), elements);
+    const TimingStatistics optimized =
+        summarize_samples(std::move(optimized_samples_us), elements);
 
     *result = {
         &benchmark_case,
         warmups,
         iterations,
-        median_us,
-        mean_us,
-        samples_us.front(),
-        percentile_95(samples_us),
         elements,
-        elements_per_second,
-        elements_per_second * sizeof(float) / kBytesPerGiB,
+        baseline,
+        optimized,
+        baseline.median_us / optimized.median_us,
     };
     return true;
 }
@@ -426,8 +641,12 @@ bool run_case(
 void write_csv(std::ostream& output, const std::vector<BenchmarkResult>& results) {
     output
         << "case,size,head_pattern,batch_size,num_heads,seq_len,past_len,"
-           "sliding_window,warmups,iterations,median_us,mean_us,min_us,p95_us,"
-           "output_elements,elements_per_sec,effective_output_gib_per_sec\n";
+           "sliding_window,warmups,iterations,baseline_median_us,"
+           "optimized_median_us,speedup,baseline_mean_us,optimized_mean_us,"
+           "baseline_min_us,optimized_min_us,baseline_p95_us,optimized_p95_us,"
+           "output_elements,baseline_elements_per_sec,"
+           "optimized_elements_per_sec,baseline_effective_output_gib_per_sec,"
+           "optimized_effective_output_gib_per_sec\n";
     output << std::fixed << std::setprecision(3);
     for (const BenchmarkResult& result : results) {
         const BenchmarkCase& benchmark_case = *result.benchmark_case;
@@ -437,11 +656,17 @@ void write_csv(std::ostream& output, const std::vector<BenchmarkResult>& results
                << ',' << benchmark_case.seq_len << ','
                << benchmark_case.past_len << ','
                << benchmark_case.sliding_window << ',' << result.warmups << ','
-               << result.iterations << ',' << result.median_us << ','
-               << result.mean_us << ',' << result.min_us << ',' << result.p95_us
-               << ',' << result.output_elements << ','
-               << result.elements_per_second << ','
-               << result.effective_output_gib_per_second << '\n';
+               << result.iterations << ',' << result.baseline.median_us << ','
+               << result.optimized.median_us << ',' << result.speedup << ','
+               << result.baseline.mean_us << ',' << result.optimized.mean_us
+               << ',' << result.baseline.min_us << ','
+               << result.optimized.min_us << ',' << result.baseline.p95_us
+               << ',' << result.optimized.p95_us << ','
+               << result.output_elements << ','
+               << result.baseline.elements_per_second << ','
+               << result.optimized.elements_per_second << ','
+               << result.baseline.effective_output_gib_per_second << ','
+               << result.optimized.effective_output_gib_per_second << '\n';
     }
 }
 
@@ -516,9 +741,11 @@ int main(int argc, char** argv) {
               << std::setprecision(3) << peak_memory_gb_per_second
               << " GB/s calculated peak, " << properties.l2CacheSize
               << "-byte L2 cache.\n";
-    std::cerr << "Timed only launch_hybrid_attention_mask() with CUDA events; "
-                 "setup, copies, warmups, synchronization waits, and CSV output "
-                 "are outside measured intervals.\n";
+    std::cerr
+        << "Validated baseline and row-oriented outputs byte-for-byte, then "
+           "timed both launchers with alternating order and CUDA events; "
+           "setup, copies, warmups, synchronization waits, and CSV output are "
+           "outside measured intervals.\n";
 
     if (options.output_path.empty()) {
         write_csv(std::cout, results);
