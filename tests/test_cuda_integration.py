@@ -43,6 +43,25 @@ CASES = [
     pytest.param(
         MaskCase(2, 2, 1, 3, 2, (True, False)), id="single-query"
     ),
+    pytest.param(
+        MaskCase(2, 4, 32, 0, 8, (True,) * 4), id="stress-all-full"
+    ),
+    pytest.param(
+        MaskCase(2, 8, 64, 32, 16, (False,) * 8),
+        id="stress-all-sliding-with-past",
+    ),
+    pytest.param(
+        MaskCase(1, 16, 128, 128, 32, (True, False) * 8),
+        id="stress-alternating-with-past",
+    ),
+    pytest.param(
+        MaskCase(4, 8, 64, 64, 1, (False,) * 8),
+        id="stress-window-one",
+    ),
+    pytest.param(
+        MaskCase(2, 4, 32, 0, 128, (False,) * 4),
+        id="stress-window-larger-than-context",
+    ),
 ]
 
 

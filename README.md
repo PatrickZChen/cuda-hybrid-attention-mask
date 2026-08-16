@@ -64,17 +64,33 @@ Implemented now:
 
 Validation status:
 
-- The Python reference tests are validated on the current macOS development host.
-- CUDA integration tests skip clearly when the runner or a CUDA-capable device is unavailable.
-- The current host has no NVIDIA CUDA compiler or device, so CUDA compilation and runtime correctness validation remain pending on an NVIDIA CUDA environment.
+- The Python reference and CUDA integration tests pass on an NVIDIA CUDA host.
+- The baseline CUDA output matches the PyTorch reference elementwise across the integration suite.
+- Compute Sanitizer memcheck passes on a representative mixed-head case with `ERROR SUMMARY: 0 errors`.
 
 Planned later:
 
-- Baseline GPU compile/runtime validation on NVIDIA hardware
 - GPU profiling and kernel optimization
 - GPU benchmarking
 
-No performance claims or optimized CUDA techniques are included in Milestone 2.
+No performance claims or optimized CUDA techniques are included in this baseline.
+
+## GPU Validation
+
+Hardware:
+NVIDIA GeForce RTX 4080 Laptop GPU
+
+CUDA Toolkit:
+12.5
+
+Validation:
+Baseline CUDA output validated elementwise against the PyTorch reference.
+
+Compute Sanitizer memcheck:
+Representative mixed-head case passed with `ERROR SUMMARY: 0 errors`.
+
+Final pytest result:
+41 passed, 0 failed, 0 skipped.
 
 ## Setup and tests
 
@@ -126,4 +142,4 @@ mask = create_hybrid_attention_mask(
 
 ## Next milestone
 
-Milestone 3: GPU validation, profiling, and optimization after the baseline is proven correct on NVIDIA hardware.
+Profiling, benchmarking, and optimization remain deferred.
